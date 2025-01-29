@@ -94,6 +94,10 @@ pub fn display_width(text: &str) -> usize {
         OpenBracket,
         /// We just ended the escape by seeing an m
         AfterEscape,
+        /// We are inside an OSC sequence: ESC ] ...
+        Osc,
+        /// We saw ESC inside an OSC sequence, need to check if it's followed by '\'.
+        OscEscapeChar,
     }
 
     let width = UnicodeWidthStr::width(text);
@@ -101,25 +105,70 @@ pub fn display_width(text: &str) -> usize {
     let mut hidden = 0;
 
     for c in text.chars() {
-        state = match (state, c) {
-            (State::Normal, '\u{1b}') => State::EscapeChar,
-            (State::EscapeChar, '[') => State::OpenBracket,
-            (State::EscapeChar, _) => State::Normal,
-            (State::OpenBracket, 'm') => State::AfterEscape,
-            _ => state,
-        };
-
-        // We don't count escape characters as hidden as
-        // UnicodeWidthStr::width already considers them.
-        if matches!(state, State::OpenBracket | State::AfterEscape) {
-            // but if we see an escape char *inside* the ANSI escape, we should ignore it.
-            if UnicodeWidthChar::width(c).unwrap_or(0) > 0 {
-                hidden += 1;
+        let normalized = c.to_string();
+        match state {
+            State::Normal => {
+                if c == '\u{1b}' {
+                    state = State::EscapeChar;
+                }
             }
-        }
-
-        if state == State::AfterEscape {
-            state = State::Normal;
+            State::EscapeChar => {
+                if c == '[' {
+                    // CSI sequence
+                    state = State::OpenBracket;
+                } else if c == ']' {
+                    // OSC sequence
+                    state = State::Osc;
+                    hidden += 2;
+                } else {
+                    // Not recognized, return to normal
+                    state = State::Normal;
+                }
+            }
+            State::OpenBracket => {
+                // If we still see printable characters here,
+                // count them as hidden (ANSI code).
+                if c == 'm' {
+                    // End of a typical CSI sequence
+                    state = State::AfterEscape;
+                } else if c == '\u{1b}' {
+                    // Another escape inside
+                    state = State::EscapeChar;
+                }
+                if UnicodeWidthChar::width(c).unwrap_or(0) > 0 {
+                    hidden += 1;
+                }
+            }
+            State::AfterEscape => {
+                // Transition back to normal
+                state = State::Normal;
+                // The character that ended the escape is hidden as well
+                if UnicodeWidthChar::width(c).unwrap_or(0) > 0 {
+                    hidden += 1;
+                }
+            }
+            State::Osc => {
+                // Inside an OSC sequence, skip everything until we see ESC \
+                if c == '\u{1b}' {
+                    state = State::OscEscapeChar;
+                }
+                // If it's printable, hide it (it's part of the OSC sequence).
+                if UnicodeWidthChar::width(c).unwrap_or(0) > 0 {
+                    hidden += 1;
+                }
+            }
+            State::OscEscapeChar => {
+                // If we see '\', it ends the OSC sequence, otherwise stay in OSC
+                if c == '\\' {
+                    state = State::Normal;
+                    hidden += 2;
+                } else {
+                    state = State::Osc;
+                    if UnicodeWidthChar::width(c).unwrap_or(0) > 0 {
+                        hidden += 1;
+                    }
+                }
+            }
         }
     }
 
@@ -185,6 +234,31 @@ mod tests {
         out.write_all(b"").unwrap();
         out.write_all(b"bar").unwrap();
         assert_eq!(out.as_string(), "foo bar");
+    }
+
+    #[test]
+    fn display_width_hyperlinks() {
+        // Test basic hyperlink
+        let just_text = "link text";
+        let link = "\x1B]8;;https://example.com\x1B\\link text\x1B]8;;\x1B\\";
+        assert_eq!(display_width(link), display_width(just_text)); // "link text" length
+
+        // Test hyperlink with ANSI color
+        // let just_text = "colored text";
+        // let colored_link =
+        //     "\x1B[31m\x1B]8;;https://example.com\x1B\\colored link\x1B]8;;\x1B\\\x1B[0m";
+        // assert_eq!(display_width(colored_link), display_width(just_text)); // "colored link" length
+
+        // // Test multiple hyperlinks in one string
+        // let multiple_links = "normal \x1B]8;;https://example.com\x1B\\link1\x1B]8;;\x1B\\ and \x1B]8;;https://test.com\x1B\\link2\x1B]8;;\x1B\\";
+        // assert_eq!(
+        //     display_width(multiple_links),
+        //     display_width("normal link1 and link2")
+        // );
+
+        // // Test nested formatting
+        // let nested = "\x1B]8;;https://example.com\x1B\\\x1B[1mBold Link\x1B[0m\x1B]8;;\x1B\\";
+        // assert_eq!(display_width(nested), display_width("Bold Link"));
     }
 
     #[test]
